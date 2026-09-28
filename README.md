@@ -1,110 +1,231 @@
-# Whole-Slide Image (WSI) Pathology Analysis Pipeline
+# Prostate Cancer Grading from Whole-Slide Images (PANDA Challenge)
 
-A PyTorch-based pipeline that simulates end-to-end analysis of a **gigapixel whole-slide histopathology image**: tissue segmentation, patch extraction, deep-learning-based patch classification, and heatmap reconstruction for abnormality localization.
+A PyTorch pipeline that predicts the **ISUP grade (0-5)** of prostate cancer from H&E-stained biopsy whole-slide images (WSIs). It uses the data from the Kaggle [Prostate cANcer graDe Assessment (PANDA) Challenge](https://www.kaggle.com/competitions/prostate-cancer-grade-assessment) and fine-tunes an ImageNet-pretrained **ResNet-34** on tissue-tile mosaics built from each slide.
 
-The notebook is self-contained and runs out of the box (e.g., on Kaggle/Colab) using a **synthetically generated slide**, so no external dataset or GPU is strictly required to try it out.
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Pipeline](#pipeline)
+- [Repository Structure](#repository-structure)
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Model & Training Details](#model--training-details)
+- [Evaluation Metrics](#evaluation-metrics)
+- [Outputs](#outputs)
+- [Results](#results)
+- [Known Limitations & Ideas for Improvement](#known-limitations--ideas-for-improvement)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
+---
 
 ## Overview
 
-Whole-slide images (WSIs) used in digital pathology are extremely large (often tens of thousands of pixels per side), far too big to feed directly into a CNN. The standard approach — reproduced here — is to:
+Gleason/ISUP grading of prostate biopsies is time-consuming and subject to inter-observer variability. This project explores an automated approach:
 
-1. Downsample the slide to a thumbnail for fast preprocessing.
-2. Segment tissue from background (glass slide).
-3. Tile the full-resolution slide into small patches, keeping only patches that overlap sufficient tissue.
-4. Run a CNN classifier over the patches in batches.
-5. Stitch the per-patch predictions back into a low-resolution probability heatmap.
-6. Threshold the heatmap and draw bounding boxes around candidate abnormal regions.
+1. Read a giant multi-resolution WSI (`.tiff`) with OpenSlide.
+2. Cut it into fixed-size tiles and keep the tiles that contain the most tissue.
+3. Stitch those tiles into a single compact image.
+4. Classify that image into one of six ISUP grades with a CNN.
 
-## Pipeline Stages
+The whole workflow (data download, splitting, training, validation, and held-out testing) lives in a single notebook, `fullcode.ipynb`.
 
-| Stage | Component | Description |
-|---|---|---|
-| 0 | `Config` | Central place for all hyperparameters (patch size, stride, thresholds, batch size, device, etc.). |
-| 1 | `TissueSegmenter` | Converts the thumbnail to HSV, applies Otsu thresholding on the saturation channel, and cleans the mask with morphological opening/closing to separate tissue from the white glass background. |
-| 2 | `PatchExtractor` | Builds a coordinate grid over the full-resolution image and discards patches whose corresponding region in the tissue mask falls below a minimum tissue ratio. |
-| 3 | `PathologyPatchDataset` | A lazy-loading `torch.utils.data.Dataset` that crops each patch on demand (rather than pre-loading all patches into memory) and applies the image transform. |
-| 4 | `build_pathology_classifier` / `run_batch_inference` | A ResNet-18 backbone (ImageNet-pretrained) with a custom binary classification head (`Linear → ReLU → Dropout → Linear → Sigmoid`), run over the patch `DataLoader` with mixed-precision (`torch.amp.autocast`) inference. |
-| 5 | `HeatmapReconstructor` | Reassembles per-patch probabilities into a 2D probability map, resizes it to the thumbnail resolution, overlays it as a color heatmap, and extracts bounding boxes of high-probability regions via contour detection. |
-| 6 | `main()` | Orchestrates the full pipeline end-to-end and renders a 4-panel visualization. |
+## Pipeline
 
-## Output
+```
+Kaggle PANDA data
+      │
+      ▼
+Stratified split by ISUP grade  (70% train / 15% val / 15% test)
+      │
+      ▼
+WSI (.tiff) ──► read at level 1 ──► pad to multiple of 256 ──► 256×256 tiles
+      │
+      ▼
+Rank tiles by darkness (sum of pixel values) ──► keep top 16 tissue-rich tiles
+      │
+      ▼
+Stitch into 4×4 grid (1024×1024 RGB image)
+      │
+      ▼
+Augment + normalize ──► ResNet-34 (6-way head) ──► ISUP grade prediction
+```
 
-Running the notebook produces a 4-panel figure:
+**Tile selection.** A tile with a lower total pixel sum is darker, i.e. it contains more stained tissue and less white background. The 16 darkest tiles are selected. If a slide has fewer than 16 tiles, the grid is padded with blank white tiles.
 
-1. **Original Slide Thumbnail** – the downsampled RGB thumbnail.
-2. **Tissue Foreground Mask** – binary mask separating tissue from background.
-3. **Probability Heatmap** – per-region classifier confidence, reconstructed to thumbnail resolution.
-4. **ROI Detection Overlay** – the heatmap blended onto the thumbnail with bounding boxes drawn around candidate abnormal regions.
+## Repository Structure
 
-Console output also reports slide dimensions, grid size, the fraction of tiles retained after tissue filtering, and the number of candidate ROIs detected.
+```
+.
+├── fullcode.ipynb          # Full pipeline: data, model, training, evaluation
+├── README.md
+└── best_panda_resnet34.pth # Generated after training (best validation QWK)
+```
 
 ## Requirements
 
-```
-torch
-torchvision
-opencv-python
-numpy
-matplotlib
-tqdm
-```
+- Python 3.9+
+- A CUDA-capable GPU is strongly recommended (the script falls back to CPU, but training will be very slow; mixed-precision training uses `torch.cuda.amp`)
+- OpenSlide system library (needed by `openslide-python`)
+- A Kaggle account with the PANDA competition rules accepted
 
-Install with:
+Python packages:
+
+| Package | Purpose |
+|---|---|
+| `torch`, `torchvision` | Model, transforms, training |
+| `openslide-python`, `tiffslide` | Reading multi-resolution WSIs |
+| `numpy`, `pandas` | Array and metadata handling |
+| `scikit-learn` | Splitting and metrics (QWK, report, confusion matrix) |
+| `opencv-python`, `matplotlib` | Imaging / plotting utilities |
+| `tqdm` | Progress bars |
+| `kagglehub` | Automatic dataset download |
+
+## Setup
+
+### 1. Clone the repository
 
 ```bash
-pip install torch torchvision opencv-python numpy matplotlib tqdm
+git clone https://github.com/<your-username>/<your-repo>.git
+cd <your-repo>
 ```
 
-A CUDA-capable GPU is used automatically if available (`Config.DEVICE`), otherwise the pipeline falls back to CPU.
+### 2. Install the OpenSlide system library
+
+```bash
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install -y openslide-tools
+
+# macOS (Homebrew)
+brew install openslide
+```
+
+On Windows, download the OpenSlide binaries from [openslide.org](https://openslide.org/download/) and add them to your `PATH`.
+
+### 3. Install Python dependencies
+
+```bash
+pip install torch torchvision opencv-python numpy pandas matplotlib tqdm \
+            scikit-learn kagglehub openslide-python tiffslide
+```
+
+### 4. Set up Kaggle access
+
+1. Join the [PANDA competition](https://www.kaggle.com/competitions/prostate-cancer-grade-assessment) and accept its rules.
+2. Create an API token in your Kaggle account settings and place `kaggle.json` in `~/.kaggle/` (or set the `KAGGLE_USERNAME` / `KAGGLE_KEY` environment variables).
 
 ## Usage
 
-Run all cells in the notebook, or extract the code into a `.py` file and run:
+Open and run the notebook:
 
 ```bash
-python pathology_pipeline.py
+jupyter notebook fullcode.ipynb
 ```
 
-### Using your own slide
+Or run it on Kaggle / Google Colab with a GPU runtime. When executed, the notebook will:
 
-By default the pipeline generates a **synthetic slide** for demonstration purposes. To run it on a real whole-slide image instead:
+1. Download the PANDA dataset with `kagglehub.competition_download(...)`.
+2. Build stratified train / validation / test splits.
+3. Train the model for the configured number of epochs, saving the checkpoint with the best validation QWK.
+4. Reload the best checkpoint and evaluate it once on the held-out test set.
 
-```python
-class Config:
-    USE_SYNTHETIC_IMAGE = False
-    ...
-```
+> **Note:** The PANDA training set is very large (hundreds of GB). Make sure you have sufficient disk space and bandwidth before starting.
 
-and update the image path in `main()`:
+## Configuration
 
-```python
-wsi_image = cv2.imread("path_to_slide.tif")
-wsi_image = cv2.cvtColor(wsi_image, cv2.COLOR_BGR2RGB)
-```
-
-### Key configuration options (`Config`)
+All hyperparameters are defined in the `Config` class at the top of the notebook:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `PATCH_SIZE` | 256 | Size (pixels) of each extracted patch. |
-| `STRIDE` | 256 | Step size between patches (equal to `PATCH_SIZE` ⇒ non-overlapping tiling). |
-| `THUMB_SCALE` | 0.05 | Downsampling factor used to build the thumbnail for tissue segmentation. |
-| `TISSUE_THRESHOLD` | 0.15 | Minimum fraction of tissue pixels required to keep a patch. |
-| `BATCH_SIZE` | 64 | Inference batch size. |
-| `NUM_WORKERS` | 2 | DataLoader worker processes. |
-| `HEATMAP_ALPHA` | 0.45 | Blend weight of the heatmap overlay on the thumbnail. |
+| `TILE_SIZE` | `256` | Side length (pixels) of each tile |
+| `N_TILES` | `16` | Number of tissue tiles per slide (must be a perfect square) |
+| `NUM_CLASSES` | `6` | ISUP grades 0-5 |
+| `BATCH_SIZE` | `16` | Batch size |
+| `EPOCHS` | `4` | Number of training epochs |
+| `LR` | `3e-4` | Learning rate (AdamW) |
+| `NUM_WORKERS` | `2` | DataLoader workers |
+| `DEVICE` | `cuda` if available, else `cpu` | Compute device |
+| `SEED` | `42` | Random seed for reproducibility |
 
-## ⚠️ Important Caveats
+## Model & Training Details
 
-- **The classifier is not trained.** `build_pathology_classifier()` loads ImageNet-pretrained ResNet-18 weights but attaches a freshly initialized (random) classification head. The pipeline is therefore a **structural / engineering demonstration** of a scalable WSI inference pipeline — the heatmaps and bounding boxes it produces do **not** reflect real pathological findings.
-- **The demo slide is synthetic.** `create_synthetic_wsi()` draws simple colored ellipses with noise to mimic tissue at a large scale; it is not derived from real histology.
-- To make this pipeline clinically or scientifically meaningful, you would need to:
-  1. Train (or fine-tune) the classification head — and likely the backbone — on labeled histopathology patches.
-  2. Validate on held-out real WSIs.
-  3. Add proper WSI I/O (e.g., via [OpenSlide](https://openslide.org/)) for formats like `.svs`/`.tif` rather than loading a whole image into memory with `cv2.imread`.
+| Component | Choice |
+|---|---|
+| Backbone | ResNet-34, ImageNet-pretrained (`ResNet34_Weights.DEFAULT`) |
+| Head | Final fully connected layer replaced with `Linear(512, 6)` |
+| Input | 1024×1024 stitched mosaic of 16 tiles (256×256 each) |
+| Loss | Cross-entropy |
+| Optimizer | AdamW (`lr=3e-4`, `weight_decay=1e-4`) |
+| Precision | Automatic mixed precision (AMP) with `GradScaler` |
+| Augmentation (train) | Random horizontal and vertical flips |
+| Normalization | ImageNet mean/std |
+| Model selection | Best validation Quadratic Weighted Kappa |
+| Data split | 70% train / 15% val / 15% test, stratified by `isup_grade` |
 
-This project is intended as a **reference implementation / starting point** for building scalable, memory-efficient WSI inference pipelines in PyTorch, not as a diagnostic tool.
+Tiles are extracted **on the fly** in the `Dataset`, so no preprocessed images need to be stored on disk.
+
+## Evaluation Metrics
+
+- **Quadratic Weighted Kappa (QWK)**: the official PANDA challenge metric. It penalizes predictions more heavily the further they are from the true grade.
+- **Accuracy**
+- **Cross-entropy loss**
+- **Per-class precision / recall / F1** (`classification_report`)
+- **Confusion matrix**
+
+## Outputs
+
+| Output | Description |
+|---|---|
+| `best_panda_resnet34.pth` | State dict of the model with the highest validation QWK |
+| Console logs | Per-epoch train/validation loss, accuracy and QWK |
+| Test report | Final loss, accuracy, QWK, classification report and confusion matrix on the held-out test set |
+
+Loading the trained model for inference:
+
+```python
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+model = models.resnet34()
+model.fc = nn.Linear(model.fc.in_features, 6)
+model.load_state_dict(torch.load("best_panda_resnet34.pth", map_location="cpu"))
+model.eval()
+```
+
+## Results
+
+> Fill in after running the notebook.
+
+| Split | Loss | Accuracy | QWK |
+|---|---|---|---|
+| Validation | - | - | - |
+| Test | - | - | - |
+
+## Known Limitations & Ideas for Improvement
+
+- **Short training.** Only 4 epochs are configured by default; more epochs with a learning-rate scheduler would likely help.
+- **Simple tile selection.** Tiles are ranked by pixel-sum darkness, which can pick up pen marks or dark artifacts. A proper tissue mask (e.g. Otsu thresholding or HSV saturation) would be more robust.
+- **Single resolution.** Only level 1 of the slide is used; multi-scale tiles could capture both context and cellular detail.
+- **Classification loss only.** Since ISUP grades are ordinal, a regression or ordinal loss (with optimized thresholds) often improves QWK.
+- **Label noise.** PANDA labels come from multiple sources (Radboud, Karolinska) with differing annotation quality; the provided segmentation masks are not used here.
+- **Class imbalance.** Consider weighted sampling or class-weighted loss.
+- **Stronger backbones and augmentation.** EfficientNet / ConvNeXt, color jitter, and stain augmentation are natural next steps.
+- **Data loading speed.** On-the-fly WSI reading is I/O heavy; caching the stitched mosaics would speed up training.
+
+## Acknowledgements
+
+- [PANDA Challenge](https://www.kaggle.com/competitions/prostate-cancer-grade-assessment) organizers and the underlying study: Bulten et al., *Artificial intelligence for diagnosis and Gleason grading of prostate cancer: the PANDA challenge*, Nature Medicine, 2022.
+- [PyTorch](https://pytorch.org/), [torchvision](https://pytorch.org/vision/), [OpenSlide](https://openslide.org/), [scikit-learn](https://scikit-learn.org/).
 
 ## License
 
-Add a license of your choice (e.g., MIT) here.
+Add your preferred license here (e.g. MIT). Note that use of the PANDA dataset is governed by the Kaggle competition rules.
+
+## Disclaimer
+
+This project is for research and educational purposes only. It is **not** a medical device and must not be used for clinical decision-making.
